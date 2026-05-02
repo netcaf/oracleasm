@@ -507,7 +507,13 @@ oracleasm createdisk DATA2 /dev/loop2
 oracleasm listdisks   # confirm DATA2 is listed
 ```
 
-Run as **oracle** (`asmenv` + `sqlplus / as sysasm`):
+Run as **oracle**:
+
+```bash
+su - oracle
+asmenv
+sqlplus / as sysasm
+```
 
 ```sql
 -- Add disk to existing diskgroup; ASM rebalances automatically
