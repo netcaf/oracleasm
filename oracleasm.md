@@ -519,12 +519,20 @@ sqlplus / as sysasm
 -- Add disk to existing diskgroup; ASM rebalances automatically
 ALTER DISKGROUP DATA ADD DISK '/dev/oracleasm/disks/DATA2';
 
--- Monitor rebalance progress (returns no rows when complete)
+-- 1. Wait for rebalance to complete (no rows = done)
 SELECT group_number, operation, state, est_minutes FROM v$asm_operation;
 
--- Verify new capacity
+-- 2. Confirm new disk is MEMBER/NORMAL in the group
+SELECT path, name, state, header_status FROM v$asm_disk WHERE group_number > 0;
+
+-- 3. Confirm total capacity increased
 SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
 ```
+
+All three checks must pass before the disk is confirmed working:
+- `v$asm_operation` — no rows (rebalance complete)
+- `v$asm_disk` — new disk shows `state=NORMAL`, `header_status=MEMBER`
+- `v$asm_diskgroup` — `total_mb` reflects both disks combined
 
 ### Option B — Create a new diskgroup (e.g., FRA)
 
