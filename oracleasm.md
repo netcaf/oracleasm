@@ -1,6 +1,7 @@
 # Oracle 21c + ASM 安装配置指南
 
 ## 环境说明
+- Hyper-V: Dynamic Memory 4096MB
 - OS: Oracle Linux 7.9 (Hyper-V 虚拟机)
 - 内核: UEK 5.4.17
 - Oracle Grid Infrastructure 21c + Oracle Database 21c
@@ -204,6 +205,21 @@ chmod 750 cssdagent ocssd.bin cssdmonitor
 setcap cap_sys_nice+ep cssdagent
 setcap cap_sys_nice+ep ocssd.bin
 
+# 修复 ocssd.bin owner（原步骤漏了这行）
+chown oracle:oinstall ocssd.bin
+
+# 修复 Grid oracle 二进制的组和 setgid 位 ⚠️
+# Grid home oracle 默认 group=oinstall、无 setgid，
+# 而 DB home oracle 是 group=dba + setgid，
+# 导致 ASM 进程 EGID=oinstall，ASMB 进程 EGID=dba，IPC 共享内存跨组无法访问（ORA-27123）
+chown oracle:dba /u01/app/grid/product/21c/grid/bin/oracle
+chmod 6755 /u01/app/grid/product/21c/grid/bin/oracle
+
+# 验证两个 oracle 二进制的 group 和 setgid 一致
+ls -la /u01/app/grid/product/21c/grid/bin/oracle
+ls -la /u01/app/oracle/product/21c/dbhome/bin/oracle
+# 期望：两者都是 oracle:dba，且都有 setgid 位 (s)
+
 # 验证 cssdagent 能正常加载库
 su - oracle -c "/u01/app/grid/product/21c/grid/bin/cssdagent"
 # 正常：输出包含 "successfully setting priority"，最后 segfault 属正常
@@ -230,7 +246,7 @@ systemctl start oracle-ohasd
 # 步骤三：触发 CSS 启动（需等待 2-5 分钟才返回，属正常现象）
 # 可在另一个终端监控：tail -f /u01/app/oracle/diag/crs/localhost/crs/trace/alert.log
 # 等待看到 CRS-1601: CSSD Reconfiguration complete 说明成功
-# /u01/app/grid/product/21c/grid/bin/crsctl start res ora.cssd -init
+/u01/app/grid/product/21c/grid/bin/crsctl start res ora.cssd -init
 
 # 步骤四：注册 ASM 资源（只需执行一次）
 /u01/app/grid/product/21c/grid/bin/srvctl add asm
@@ -276,50 +292,110 @@ Oracle Grid Infrastructure 的资源是分层启动的，有两个层次：
 
 ## 四、创建 ASM 磁盘组
 
-```bash
-su - oracle
-export ORACLE_HOME=/u01/app/grid/product/21c/grid
-export ORACLE_SID=+ASM
-export PATH=$ORACLE_HOME/bin:$PATH
+## ASM 磁盘组缺失排查与修复
 
+**场景：ASM ONLINE，但 ora.DATA.dg OFFLINE 或不存在**
+
+---
+
+### 诊断
+
+```bash
+# OS 层确认磁盘是否可见
+oracleasm listdisks
+# 无输出则先执行：oracleasm scandisks
+```
+
+```sql
+-- 进入 ASM
+su - oracle
+export ORACLE_SID=+ASM
+export ORACLE_HOME=/u01/app/grid/product/21c/grid
+export PATH=$ORACLE_HOME/bin:$PATH
+sqlplus / as sysasm
+
+-- 磁盘搜索路径，VALUE 为空是根本原因
+SHOW PARAMETER asm_diskstring;
+
+-- 磁盘是否可见，无行 = 路径未设置
+SELECT path, header_status FROM v$asm_disk;
+
+-- 磁盘组状态，MOUNTED=正常 DISMOUNTED=未挂载 无行=不存在
+SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
+```
+
+---
+
+### 修复
+
+```sql
+-- Step 1：asm_diskstring 为空时，先临时设置
+ALTER SYSTEM SET asm_diskstring='/dev/oracleasm/disks/*' SCOPE=MEMORY;
+
+-- Step 2a：磁盘组存在但未 mount
+ALTER DISKGROUP DATA MOUNT;
+--如遇到错误，则
+SELECT path, header_status, name FROM v$asm_disk;
+--如果为PROVISIONED，则可以直接使用， Step 2b
+
+```
+`header_status` 的值决定下一步：
+
+| header_status | 含义 | 处理 |
+|---|---|---|
+| `MEMBER` | 属于某个磁盘组 | 磁盘组元数据问题 |
+| `PROVISIONED` | 标记过但未格式化 | 可以重新 CREATE |
+| `FOREIGN` | 属于其他磁盘组 | 需要强制清除 |
+| `CANDIDATE` | 干净，未使用 | 可以直接 CREATE |
+
+```
+-- Step 2b：磁盘组不存在，创建（一次性，永不重复）
+CREATE DISKGROUP DATA EXTERNAL REDUNDANCY DISK '/dev/oracleasm/disks/DATA1';
+
+-- 手动挂载磁盘组（磁盘组存在但未 mount 时）
+ALTER DISKGROUP DATA MOUNT;
+```
+
+---
+
+### 永久固化（一次性配置）
+
+```sql
+-- 没有 SPFILE 时先创建
+SHOW PARAMETER spfile;
+CREATE SPFILE FROM MEMORY;
+```
+``` bash
+# Check the file created
+ls -la /u01/app/grid/product/21c/grid/dbs/spfile+ASM.ora
+```
+
+```bash
+# 重启 ASM 让 SPFILE 生效
+srvctl stop diskgroup -g DATA
+srvctl stop asm
+srvctl start asm
 sqlplus / as sysasm
 ```
 
 ```sql
--- --------------------------------------------
--- 一次性命令（只执行一次，永不重复）
--- --------------------------------------------
+-- Check again
+SHOW PARAMETER spfile;
 
--- 创建磁盘组，相当于格式化磁盘
-CREATE DISKGROUP DATA EXTERNAL REDUNDANCY DISK '/dev/oracleasm/disks/DATA1';
-
-
--- --------------------------------------------
--- 永久配置（只配置一次，写入 SPFILE 持久化）
--- --------------------------------------------
-
--- 告诉 ASM 去哪找磁盘，重启后依然生效
-ALTER SYSTEM SET asm_diskstring='/dev/oracleasm/disks/*' SCOPE=SPFILE;
-
-
--- --------------------------------------------
--- 临时补救命令（scandisks 晚于 ASM 启动时才用）
--- --------------------------------------------
-
--- 临时让 ASM 重新扫描磁盘路径，重启后失效，第一次为空需要扫描操作。
-ALTER SYSTEM SET asm_diskstring='/dev/oracleasm/disks/*' SCOPE=MEMORY;
-
--- 手动挂载磁盘组（磁盘组存在但未 mount 时）
-ALTER DISKGROUP DATA MOUNT;
-
-
--- --------------------------------------------
--- 查询命令（随时可用）
--- --------------------------------------------
-
--- 查看磁盘组状态
-SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
+-- 永久写入，重启后自动生效
+ALTER SYSTEM SET asm_diskstring='/dev/oracleasm/disks/*' SCOPE=BOTH;
+SHOW PARAMETER asm_diskstring;  -- 确认
 ```
+
+```bash
+# 配置开机自动 scandisks
+oracleasm configure -i    # SCANBOOT 选 y
+
+# 确认修复
+/u01/app/grid/product/21c/grid/bin/crsctl stat res -t        # ora.DATA.dg = ONLINE ✅
+```
+
+---
 
 > **重启后磁盘组丢失恢复**：
 > ```bash
@@ -395,24 +471,59 @@ dbca -silent \
   -datafileDestination '+DATA' \
   -recoveryAreaDestination NONE \
   -databaseType MULTIPURPOSE \
-  -totalMemory 800 \
+  -totalMemory 1200 \
   -emConfiguration NONE \
   -ignorePreReqs
 ```
 
-> **dbca 失败恢复**：如果 dbca 失败后 ASM 空间不足，清理残留文件重建：
+> **dbca 失败恢复**：dbca 失败后按以下顺序处理：
+>
+> **1. 确认 Grid oracle 二进制权限正确（一次性）**
 > ```bash
-> export ORACLE_HOME=/u01/app/grid/product/21c/grid
-> export ORACLE_SID=+ASM
-> export PATH=$ORACLE_HOME/bin:$PATH
-> sqlplus / as sysasm
-> DROP DISKGROUP DATA INCLUDING CONTENTS;
-> exit
-> sqlplus / as sysasm
-> ALTER SYSTEM SET asm_diskstring='/dev/oracleasm/disks/*' SCOPE=MEMORY;
-> CREATE DISKGROUP DATA EXTERNAL REDUNDANCY DISK '/dev/oracleasm/disks/DATA1';
-> exit
-> # 重新建库
+> ls -la /u01/app/grid/product/21c/grid/bin/oracle
+> # 若 group 不是 dba 或没有 setgid，执行：
+> chown oracle:dba /u01/app/grid/product/21c/grid/bin/oracle
+> chmod 6755 /u01/app/grid/product/21c/grid/bin/oracle
+> ```
+>
+> **2. 重启 Grid 栈以清除 ocssd.bin 中缓存的旧 shmid**
+> ```bash
+> systemctl stop oracle-ohasd
+> pkill -9 -f "ohasd"; pkill -9 -f "ocssd"; pkill -9 -f "cssdagent"
+> pkill -9 -f "onmd";  pkill -9 -f "evmd";  pkill -9 -f "oraagent"
+> sleep 3
+> rm -rf /var/tmp/.oracle/* /tmp/.oracle/*
+> ipcs -m | awk 'NR>3 {print $2}' | xargs -r ipcrm -m
+> ipcs -s | awk 'NR>3 {print $2}' | xargs -r ipcrm -s
+> ldconfig
+> setcap cap_sys_nice+ep /u01/app/grid/product/21c/grid/bin/cssdagent
+> setcap cap_sys_nice+ep /u01/app/grid/product/21c/grid/bin/ocssd.bin
+> systemctl start oracle-ohasd
+> /u01/app/grid/product/21c/grid/bin/crsctl start has
+> sleep 30
+> /u01/app/grid/product/21c/grid/bin/crsctl stat res -t
+> # 确认 ora.cssd / ora.asm / ora.DATA.dg 均为 ONLINE
+> ```
+>
+> **3. 清理 ASM 残留文件（dbca 回滚不会自动删除 ASM 中的数据文件）**
+> ```bash
+> su - oracle -c "
+>   export ORACLE_HOME=/u01/app/grid/product/21c/grid
+>   export ORACLE_SID=+ASM
+>   export PATH=\$ORACLE_HOME/bin:\$PATH
+>   sqlplus -s / as sysasm <<'EOF'
+>   DROP DISKGROUP DATA INCLUDING CONTENTS;
+>   ALTER SYSTEM SET asm_diskstring='/dev/oracleasm/disks/*' SCOPE=MEMORY;
+>   CREATE DISKGROUP DATA EXTERNAL REDUNDANCY DISK '/dev/oracleasm/disks/DATA1';
+>   SELECT name, state, total_mb, free_mb FROM v\$asm_diskgroup;
+>   exit
+> EOF
+> "
+> # 确认 FREE_MB 恢复到约 5056
+> ```
+>
+> **4. 重新建库**
+> ```bash
 > export ORACLE_HOME=/u01/app/oracle/product/21c/dbhome
 > export ORACLE_SID=orcl
 > export PATH=$ORACLE_HOME/bin:$PATH
@@ -427,7 +538,7 @@ dbca -silent \
 >   -datafileDestination '+DATA' \
 >   -recoveryAreaDestination NONE \
 >   -databaseType MULTIPURPOSE \
->   -totalMemory 800 \
+>   -totalMemory 1200 \
 >   -emConfiguration NONE \
 >   -ignorePreReqs
 > ```
@@ -490,6 +601,32 @@ systemctl start oracle-ohasd
 # 期望: ora.cssd ONLINE, ora.asm ONLINE
 ```
 
+### 第三步补充：确认磁盘组已挂载
+
+`ora.DATA.dg` 是 CRS 自动资源——只有当 ASM 实例内部已将 DATA 磁盘组 MOUNT 后，它才会出现在 `crsctl stat res -t` 中。ASM 进程 ONLINE 并不等于磁盘组已挂载。
+
+```bash
+su - oracle -c "
+  export ORACLE_HOME=/u01/app/grid/product/21c/grid
+  export ORACLE_SID=+ASM
+  export PATH=\$ORACLE_HOME/bin:\$PATH
+  sqlplus -s / as sysasm <<'EOF'
+  SELECT name, state FROM v\$asm_diskgroup;
+  exit
+EOF
+"
+```
+
+- 如果 `state=MOUNTED` → 正常，`ora.DATA.dg` 应已出现在 crsctl 输出中
+- 如果 `state=DISMOUNTED` → SPFILE 中 `asm_diskstring` 为空，执行：
+  ```bash
+  # 临时恢复（重启后再次失效，需先确保 SPFILE 已设置 asm_diskstring）
+  sqlplus / as sysasm
+  ALTER SYSTEM SET asm_diskstring='/dev/oracleasm/disks/*' SCOPE=MEMORY;
+  ALTER DISKGROUP DATA MOUNT;
+  ```
+- 如果无行返回 → 磁盘组不存在，先确认 loop 设备和磁盘标签，再参考第四节创建
+
 ### 第四步：启动数据库
 ```bash
 export ORACLE_HOME=/u01/app/oracle/product/21c/dbhome
@@ -525,5 +662,7 @@ exit
 | libocr.so 找不到 | ldconfig 缓存未更新 | 启动前执行 ldconfig |
 | ORA_CRS_HOME 找不到 | 环境变量未传递 | 写入 s_crsconfig_env.txt |
 | ASM 找不到磁盘 | diskstring 未设置 | ALTER SYSTEM SET asm_diskstring |
-| 建库内存不足 | SGA 最小 560MB | totalMemory 800 + swap |
-| dbca 失败空间不足 | 上次失败残留文件 | DROP DISKGROUP 清理后重建 |
+| ora.DATA.dg 不出现在 crsctl 输出 | ASM 进程 ONLINE 但磁盘组未挂载（asm_diskstring 为空或 loop 设备不存在） | 在 ASM 内执行 ALTER SYSTEM SET asm_diskstring + ALTER DISKGROUP DATA MOUNT；挂载后自动出现 |
+| ASMB ORA-27123 Permission denied | Grid oracle 二进制 group=oinstall 无 setgid，EGID 与 DB home 不一致，IPC 共享内存跨组拒绝访问 | chown oracle:dba + chmod 6755 Grid home oracle；重启 Grid 栈清除 ocssd.bin 的旧 shmid 缓存 |
+| utlrp.sql ORA-04031 实例崩溃 | totalMemory=800 时 shared pool 不足，KSK 内部调度器无法分配内存，CDB$ROOT + PDB$SEED 编译耗尽共享池 | totalMemory 改为 1200 |
+| dbca 失败后空间不足 | dbca 回滚不删除 ASM 中已写入的数据文件/日志/临时文件（可达 3.6 GB） | DROP DISKGROUP DATA INCLUDING CONTENTS 后重建 |
