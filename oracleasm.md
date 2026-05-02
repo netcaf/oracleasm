@@ -420,16 +420,25 @@ dbca -silent \
 
 ### Verify
 
-Run as **oracle**:
+Run as **root**:
 
 ```bash
-su - oracle
-sqlplus / as sysdba
-```
-```sql
-SELECT instance_name, status FROM v$instance;
-SELECT name FROM v$datafile;
+# 1. Grid stack — CSS, ASM, and DATA diskgroup must all be ONLINE
+/u01/app/grid/product/21c/grid/bin/crsctl stat res -t
+
+# 2. Database instance and datafiles
+su - oracle -c 'sqlplus -s / as sysdba <<EOF
+SELECT instance_name, status FROM v\$instance;
+SELECT name, open_mode FROM v\$database;
+SELECT name FROM v\$datafile;
 exit
+EOF'
+
+# 3. ASM diskgroup space (override to Grid home — profile defaults to DB home)
+su - oracle -c 'ORACLE_HOME=/u01/app/grid/product/21c/grid ORACLE_SID=+ASM sqlplus -s / as sysasm <<EOF
+SELECT name, state, total_mb, free_mb FROM v\$asm_diskgroup;
+exit
+EOF'
 ```
 
 ---
