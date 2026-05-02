@@ -488,6 +488,55 @@ exit
 
 ---
 
+## VIII. Adding an ASM Disk
+
+### Option A — Expand existing diskgroup (DATA)
+
+Run as **root**:
+
+```bash
+# Create and bind the new disk image
+dd if=/dev/zero of=/opt/asm-disks/asm_disk2.img bs=1M count=5120
+losetup /dev/loop2 /opt/asm-disks/asm_disk2.img
+
+# Persist loop device across reboots
+echo 'losetup /dev/loop2 /opt/asm-disks/asm_disk2.img' >> /etc/rc.d/rc.local
+
+# Label the disk for ASM
+oracleasm createdisk DATA2 /dev/loop2
+oracleasm listdisks   # confirm DATA2 is listed
+```
+
+Run as **oracle** (`asmenv` + `sqlplus / as sysasm`):
+
+```sql
+-- Add disk to existing diskgroup; ASM rebalances automatically
+ALTER DISKGROUP DATA ADD DISK '/dev/oracleasm/disks/DATA2';
+
+-- Monitor rebalance progress (returns no rows when complete)
+SELECT group_number, operation, state, est_minutes FROM v$asm_operation;
+
+-- Verify new capacity
+SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
+```
+
+### Option B — Create a new diskgroup (e.g., FRA)
+
+Same OS steps as Option A (use a different label, e.g., `FRA1`), then:
+
+```sql
+CREATE DISKGROUP FRA EXTERNAL REDUNDANCY DISK '/dev/oracleasm/disks/FRA1';
+SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
+```
+
+### Notes
+
+- **`asm_diskstring` already covers new disks** — the wildcard `/dev/oracleasm/disks/*` discovers any newly labeled disk automatically. No change needed.
+- **Rebalancing** — `ALTER DISKGROUP ADD` triggers automatic rebalancing in the background. On 5 GB loop devices it completes in seconds; on large real disks it can be I/O intensive.
+- **EXTERNAL REDUNDANCY** — adding a disk to DATA increases capacity only, not redundancy. Mirroring requires NORMAL (2 failure groups) or HIGH (3 failure groups) redundancy, which must be set at `CREATE DISKGROUP` time.
+
+---
+
 ## Known Issues
 
 | Issue | Cause | Fix |
