@@ -547,7 +547,13 @@ SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
 
 **Pre-check** — remaining disks must have enough free space to absorb the data from the disk being removed.
 
-Run as **oracle** (`asmenv` + `sqlplus / as sysasm`):
+Run as **oracle**:
+
+```bash
+su - oracle
+asmenv
+sqlplus / as sysasm
+```
 
 ```sql
 -- Check disk layout: ensure remaining disks' free_mb >= used_mb of disk to remove
