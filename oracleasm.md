@@ -543,6 +543,50 @@ CREATE DISKGROUP FRA EXTERNAL REDUNDANCY DISK '/dev/oracleasm/disks/FRA1';
 SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
 ```
 
+### Option C — Remove a disk from a diskgroup
+
+**Pre-check** — remaining disks must have enough free space to absorb the data from the disk being removed.
+
+Run as **oracle** (`asmenv` + `sqlplus / as sysasm`):
+
+```sql
+-- Check disk layout: ensure remaining disks' free_mb >= used_mb of disk to remove
+-- used_mb = total_mb - free_mb of the disk being dropped
+SELECT path, name, total_mb, free_mb, total_mb - free_mb used_mb
+FROM v$asm_disk WHERE group_number > 0;
+```
+
+**Drop the disk** — use the `NAME` column value from `v$asm_disk`, not the path or oracleasm label:
+
+```sql
+-- ASM rebalances data off the disk automatically before removing it
+ALTER DISKGROUP DATA DROP DISK 'DATA_0001';
+
+-- Monitor rebalance (no rows = complete, safe to proceed)
+SELECT group_number, operation, state, est_minutes FROM v$asm_operation;
+
+-- Confirm disk is gone and capacity reduced
+SELECT path, name, state, header_status FROM v$asm_disk WHERE group_number > 0;
+SELECT name, state, total_mb, free_mb FROM v$asm_diskgroup;
+```
+
+**OS cleanup** — only after ASM confirms the disk is fully removed:
+
+```bash
+oracleasm deletedisk DATA2
+losetup -d /dev/loop2
+rm -f /opt/asm-disks/asm_disk2.img
+
+# Remove from rc.local
+sed -i '/asm_disk2/d' /etc/rc.d/rc.local
+```
+
+> **Warning** — never detach the loop device or delete the image file before rebalance completes. ASM would lose data mid-transfer.
+>
+> **FORCE option** — `ALTER DISKGROUP DATA DROP DISK 'DATA_0001' FORCE;` skips rebalance and is only safe when the disk has already physically failed and its data is lost. Do not use on a healthy disk.
+>
+> **Last disk** — `DROP DISK` cannot be used on the last disk in a group. Use `DROP DISKGROUP DATA INCLUDING CONTENTS;` instead.
+
 ### Notes
 
 - **`asm_diskstring` already covers new disks** — the wildcard `/dev/oracleasm/disks/*` discovers any newly labeled disk automatically. No change needed.
